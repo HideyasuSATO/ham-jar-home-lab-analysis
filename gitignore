@@ -1,0 +1,34 @@
+# Raw data (download from the original repository instead of committing)
+dataset.xlsx
+dataset(1).xlsx
+*.xls
+*.xlsx
+
+# Generated analysis outputs
+data_processed/
+analysis_outputs/
+manuscript_outputs_revised/
+
+# Large generated files
+*.tif
+*.tiff
+*.png
+*.pdf
+*.zip
+
+# R session and project files
+.Rhistory
+.RData
+.RDataTmp
+.Rproj.user/
+*.Rproj
+
+# R package/build artifacts
+.Rcheck/
+*.tar.gz
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
