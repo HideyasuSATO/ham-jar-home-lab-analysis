@@ -1,0 +1,38 @@
+# Raw HomeHam files (download separately)
+dataset.xlsx
+dataset(1).xlsx
+questionnaire.pdf
+*.xls
+*.xlsx
+
+# Generated analysis outputs
+data_processed/
+analysis_outputs/
+manuscript_outputs_revised/
+
+# R session and project files
+.Rhistory
+.RData
+.RDataTmp
+.Rproj.user/
+*.Rproj
+
+# R package/build artifacts
+.Rcheck/
+*.tar.gz
+
+# TeX and temporary build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
