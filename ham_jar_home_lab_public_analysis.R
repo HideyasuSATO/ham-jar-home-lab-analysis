@@ -1,32 +1,66 @@
-# Reproducible analysis script for the cooked ham JAR/home-lab/purchase-intent study.
-# Place dataset.xlsx in the working directory before running this script.
+# Reproducible analysis for the cooked-ham JAR/home-laboratory study.
+#
+# Data source:
+#   HomeHam, Recherche Data Gouv, Version 2
+#   https://doi.org/10.57745/GA5R6S
+#
+# Place dataset.xlsx in the working directory, start R in that directory,
+# and run source("ham_jar_home_lab_public_analysis.R").
+
+if (getRversion() < "4.1.0") {
+  stop("R 4.1.0 or later is required because this script uses the native pipe operator (|> ).")
+}
 
 HAM_ROOT_DIR <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+options(stringsAsFactors = FALSE)
 
 required_packages <- c(
   "readxl", "dplyr", "tidyr", "stringr", "purrr", "janitor", "readr",
   "lubridate", "forcats", "tibble", "ggplot2", "lme4", "lmerTest",
   "emmeans", "ordinal", "ggrepel"
 )
+
 missing_packages <- setdiff(required_packages, rownames(installed.packages()))
 if (length(missing_packages) > 0) {
-  stop("Install missing packages before running: ", paste(missing_packages, collapse = ", "))
+  stop(
+    "Install the following packages before running the analysis: ",
+    paste(missing_packages, collapse = ", ")
+  )
 }
-suppressPackageStartupMessages(invisible(lapply(required_packages, library, character.only = TRUE)))
 
+suppressPackageStartupMessages(
+  invisible(lapply(required_packages, library, character.only = TRUE))
+)
 
+HAM_VERBOSE <- isTRUE(getOption("ham.analysis.verbose", FALSE))
+ham_message <- function(...) {
+  if (HAM_VERBOSE) base::message(...)
+  invisible(NULL)
+}
+
+# ============================================================
+# 1. Data import, cleaning, QA, and demographics
+# ============================================================
 root_dir <- HAM_ROOT_DIR
 setwd(root_dir)
 
 out_dir <- file.path(root_dir, "data_processed")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
+# dataset.xlsx を優先。なければ dataset(1).xlsx を読む
 xlsx_candidates <- file.path(root_dir, c("dataset.xlsx", "dataset(1).xlsx"))
 xlsx_path <- xlsx_candidates[file.exists(xlsx_candidates)][1]
 
 if (is.na(xlsx_path)) {
   stop("dataset.xlsx or dataset(1).xlsx was not found in: ", root_dir)
 }
+
+ham_message("Reading workbook: ", xlsx_path)
+
+
+# ------------------------------------------------------------
+# 2. Helper functions
+# ------------------------------------------------------------
 
 read_ham_sheet <- function(sheet_name) {
   readxl::read_excel(
@@ -47,6 +81,8 @@ first_non_na <- function(x) {
 }
 
 as01 <- function(x) {
+  # Converts 0/1-like variables to integer 0/1.
+  # Keeps missing values.
   as.integer(as.character(x))
 }
 
@@ -78,22 +114,22 @@ add_jar_variables <- function(df) {
     "jar_salt",     "salt",
     "jar_tender",   "tender"
   )
-
+  
   for (i in seq_len(nrow(jar_specs))) {
     v <- jar_specs$jar_var[i]
     s <- jar_specs$short[i]
-
+    
     if (!v %in% names(df)) {
       stop("Missing JAR variable: ", v)
     }
-
+    
     x <- df[[v]]
-
+    
     df[[paste0(s, "_too_low")]]  <- as.integer(!is.na(x) & x < 0)
     df[[paste0(s, "_too_high")]] <- as.integer(!is.na(x) & x > 0)
     df[[paste0(s, "_dev")]]      <- as.integer(!is.na(x) & x != 0)
     df[[paste0(s, "_abs")]]      <- abs(x)
-
+    
     df[[paste0(s, "_jar3")]] <- factor(
       dplyr::case_when(
         is.na(x) ~ NA_character_,
@@ -104,15 +140,20 @@ add_jar_variables <- function(df) {
       levels = c("too_low", "jar", "too_high")
     )
   }
-
+  
   dev_cols <- paste0(jar_specs$short, "_dev")
   abs_cols <- paste0(jar_specs$short, "_abs")
-
+  
   df$jar_dev_count <- rowSums(df[, dev_cols], na.rm = FALSE)
   df$jar_severity  <- rowSums(df[, abs_cols], na.rm = FALSE)
-
+  
   df
 }
+
+
+# ------------------------------------------------------------
+# 3. Read all sheets
+# ------------------------------------------------------------
 
 expected_sheets <- c(
   "description",
@@ -140,12 +181,21 @@ names(raw) <- expected_sheets
 
 description_raw <- raw[["description"]]
 
+
+# Basic sheet overview
 qa_sheet_overview <- tibble::tibble(
   sheet = names(raw),
   n_rows = purrr::map_int(raw, nrow),
   n_cols = purrr::map_int(raw, ncol)
 )
 
+
+
+# ------------------------------------------------------------
+# 4. Product-level data
+# ------------------------------------------------------------
+
+# 4.1 Packaging / label / claim information
 packaging_product <- raw[["product packaging"]] |>
   mutate(
     product = as.character(product),
@@ -163,6 +213,7 @@ packaging_product <- raw[["product packaging"]] |>
   ) |>
   distinct(product, .keep_all = TRUE)
 
+# 4.2 Composition replicate data
 composition_replicates <- raw[["product composition"]] |>
   mutate(
     product = as.character(product),
@@ -172,6 +223,7 @@ composition_replicates <- raw[["product composition"]] |>
     salt_measured = as.numeric(salt_measured)
   )
 
+# Product-level means and SDs of measured fat/salt
 composition_product <- composition_replicates |>
   group_by(product) |>
   summarise(
@@ -184,6 +236,11 @@ composition_product <- composition_replicates |>
     expiration_date_max = max_or_na(expiration_date),
     .groups = "drop"
   )
+
+
+# ------------------------------------------------------------
+# 5. Consumer-level data
+# ------------------------------------------------------------
 
 consumer_raw <- raw[["consumer"]] |>
   mutate(
@@ -202,13 +259,81 @@ consumer_raw <- raw[["consumer"]] |>
   ) |>
   select(-test_location_from_id)
 
+# Check duplicated consumer IDs before deduplication
 qa_consumer_duplicates <- consumer_raw |>
   count(consumer, name = "n") |>
   filter(n > 1)
 
-if (nrow(qa_consumer_duplicates) > 0) {
-}
 
+# Demographic summaries are calculated from metadata records before
+# identifier deduplication. This preserves the 483 home-use and 86
+# laboratory panel records reported in the dataset. The output also
+# reports the number of unique identifiers so that the duplicated
+# laboratory identifier remains transparent.
+consumer_demographics_by_location <- consumer_raw |>
+  mutate(
+    test_location = as.character(test_location),
+    gender_chr = as.character(gender),
+    age_chr = as.character(age)
+  ) |>
+  group_by(test_location) |>
+  summarise(
+    n_metadata_records = n(),
+    n_unique_consumer_ids = n_distinct(consumer),
+    female_n = sum(gender_chr == "F", na.rm = TRUE),
+    female_pct = 100 * sum(gender_chr == "F", na.rm = TRUE) /
+      sum(!is.na(gender_chr)),
+    male_n = sum(gender_chr == "M", na.rm = TRUE),
+    male_pct = 100 * sum(gender_chr == "M", na.rm = TRUE) /
+      sum(!is.na(gender_chr)),
+    age_18_30_n = sum(age_chr == "18-30", na.rm = TRUE),
+    age_18_30_pct = 100 * sum(age_chr == "18-30", na.rm = TRUE) /
+      sum(!is.na(age_chr)),
+    age_31_50_n = sum(age_chr == "31-50", na.rm = TRUE),
+    age_31_50_pct = 100 * sum(age_chr == "31-50", na.rm = TRUE) /
+      sum(!is.na(age_chr)),
+    age_51_plus_n = sum(age_chr == "51+", na.rm = TRUE),
+    age_51_plus_pct = 100 * sum(age_chr == "51+", na.rm = TRUE) /
+      sum(!is.na(age_chr)),
+    .groups = "drop"
+  ) |>
+  mutate(
+    duplicated_identifier_records =
+      n_metadata_records - n_unique_consumer_ids,
+    metadata_note = if_else(
+      duplicated_identifier_records > 0,
+      "Demographics summarize metadata records; at least one identifier is duplicated.",
+      "Metadata records and unique identifiers coincide."
+    )
+  )
+
+consumer_demographics_long <- bind_rows(
+  consumer_raw |>
+    transmute(
+      test_location = as.character(test_location),
+      dimension = "Gender",
+      category = dplyr::recode(
+        as.character(gender),
+        "F" = "Female",
+        "M" = "Male",
+        .default = as.character(gender)
+      )
+    ),
+  consumer_raw |>
+    transmute(
+      test_location = as.character(test_location),
+      dimension = "Age",
+      category = as.character(age)
+    )
+) |>
+  filter(!is.na(test_location), !is.na(category)) |>
+  count(test_location, dimension, category, name = "n") |>
+  group_by(test_location, dimension) |>
+  mutate(percent = 100 * n / sum(n)) |>
+  ungroup() |>
+  arrange(test_location, dimension, category)
+
+# Deduplicate consumer table to avoid many-to-many joins
 consumer_clean <- consumer_raw |>
   arrange(consumer) |>
   group_by(consumer) |>
@@ -234,6 +359,11 @@ lab_questionnaire <- raw[["consumer questionnaire (lab)"]] |>
   group_by(consumer) |>
   summarise(across(everything(), first_non_na), .groups = "drop")
 
+
+# ------------------------------------------------------------
+# 6. Sensory data: liking + JAR
+# ------------------------------------------------------------
+
 sensory_raw <- raw[["product sensory properties"]] |>
   mutate(
     consumer = as.character(consumer),
@@ -252,6 +382,14 @@ sensory_raw <- raw[["product sensory properties"]] |>
   ) |>
   add_jar_variables()
 
+# Free-comment text columns are kept in sensory_raw,
+# but will be removed from sensory_analysis below.
+
+
+# ------------------------------------------------------------
+# 7. Purchase data: home-use test only
+# ------------------------------------------------------------
+
 purchase_clean <- raw[["product purchase informations"]] |>
   mutate(
     consumer = as.character(consumer),
@@ -269,9 +407,15 @@ purchase_clean <- raw[["product purchase informations"]] |>
     purchase_no = as.integer(purchase_intent == -1)
   )
 
+
+# ------------------------------------------------------------
+# 8. Join evaluation-level analysis data
+# ------------------------------------------------------------
+
 sensory_full <- sensory_raw |>
   left_join(consumer_clean, by = "consumer") |>
   mutate(
+    # Prefer location inferred from ID; use consumer sheet as backup
     test_location = coalesce(test_location, consumer_test_location),
     test_location = factor(test_location, levels = c("home", "lab"))
   ) |>
@@ -280,6 +424,7 @@ sensory_full <- sensory_raw |>
   left_join(composition_product, by = "product") |>
   left_join(purchase_clean, by = c("consumer", "product"))
 
+# Analysis data without Free-Comment text variables
 sensory_analysis <- sensory_full |>
   select(
     -any_of(c(
@@ -295,6 +440,11 @@ sensory_analysis <- sensory_full |>
     brand_type = factor(brand_type),
     company_code = factor(company_code)
   )
+
+
+# ------------------------------------------------------------
+# 9. Product-level summaries
+# ------------------------------------------------------------
 
 product_context_summary <- sensory_analysis |>
   group_by(product, test_location) |>
@@ -334,6 +484,7 @@ context_wide <- product_context_summary |>
     names_sep = "_"
   )
 
+# Products evaluated in both home and lab
 context_gain <- context_wide |>
   filter(!is.na(liking_mean_home), !is.na(liking_mean_lab)) |>
   mutate(
@@ -375,6 +526,14 @@ product_panel <- packaging_product |>
   left_join(purchase_product_summary, by = "product") |>
   arrange(product)
 
+
+# ------------------------------------------------------------
+# 10. Model-ready datasets
+# ------------------------------------------------------------
+
+# For liking models:
+# Includes both home and lab.
+# For strict home-lab comparison, use product %in% context_gain$product.
 model_liking <- sensory_analysis |>
   filter(
     !is.na(liking),
@@ -390,6 +549,8 @@ model_liking <- sensory_analysis |>
 model_liking_common_products <- model_liking |>
   filter(as.character(product) %in% as.character(context_gain$product))
 
+# For purchase intent models:
+# Home-use only, because purchase variables exist for home evaluations.
 model_purchase <- sensory_analysis |>
   filter(
     test_location == "home",
@@ -407,6 +568,11 @@ model_purchase <- sensory_analysis |>
     ),
     purchase_yes = as.integer(purchase_intent == 1)
   )
+
+
+# ------------------------------------------------------------
+# 11. QA checks
+# ------------------------------------------------------------
 
 qa_sensory_consumers_not_in_consumer <- sensory_raw |>
   distinct(consumer) |>
@@ -442,9 +608,12 @@ qa_summary <- list(
   sensory_products_not_in_packaging = qa_sensory_products_not_in_packaging,
   sensory_products_not_in_composition = qa_sensory_products_not_in_composition,
   purchase_without_sensory = qa_purchase_without_sensory,
-  home_sensory_without_purchase = qa_home_sensory_without_purchase
+  home_sensory_without_purchase = qa_home_sensory_without_purchase,
+  consumer_demographics_by_location = consumer_demographics_by_location,
+  consumer_demographics_long = consumer_demographics_long
 )
 
+# Write QA tables
 readr::write_csv(qa_sheet_overview, file.path(out_dir, "qa_sheet_overview.csv"))
 readr::write_csv(qa_consumer_duplicates, file.path(out_dir, "qa_consumer_duplicates.csv"))
 readr::write_csv(
@@ -459,6 +628,19 @@ readr::write_csv(
   qa_home_sensory_without_purchase,
   file.path(out_dir, "qa_home_sensory_without_purchase.csv")
 )
+readr::write_csv(
+  consumer_demographics_by_location,
+  file.path(out_dir, "consumer_demographics_by_location.csv")
+)
+readr::write_csv(
+  consumer_demographics_long,
+  file.path(out_dir, "consumer_demographics_long.csv")
+)
+
+
+# ------------------------------------------------------------
+# 12. Save processed data
+# ------------------------------------------------------------
 
 processed <- list(
   description = description_raw,
@@ -466,6 +648,8 @@ processed <- list(
   composition_replicates = composition_replicates,
   composition_product = composition_product,
   consumer = consumer_clean,
+  consumer_demographics_by_location = consumer_demographics_by_location,
+  consumer_demographics_long = consumer_demographics_long,
   home_questionnaire = home_questionnaire,
   lab_questionnaire = lab_questionnaire,
   sensory_raw = sensory_raw,
@@ -499,6 +683,9 @@ readr::write_csv(context_gain, file.path(out_dir, "context_gain.csv"))
 readr::write_csv(product_context_summary, file.path(out_dir, "product_context_summary.csv"))
 readr::write_csv(purchase_product_summary, file.path(out_dir, "purchase_product_summary.csv"))
 
+# ============================================================
+# 2. Main analyses
+# ============================================================
 root_dir <- HAM_ROOT_DIR
 setwd(root_dir)
 
@@ -527,6 +714,7 @@ find_file <- function(filename) {
 }
 
 read_processed_csv <- function(filename) {
+  # Processed CSVs already have clean snake_case names from 01_load_clean_ham_data.R.
   utils::read.csv(find_file(filename), stringsAsFactors = FALSE, check.names = FALSE)
 }
 
@@ -584,6 +772,8 @@ glmer_control <- lme4::glmerControl(
   optCtrl = list(maxfun = 2e5)
 )
 
+
+# Replacement for broom/broom.mixed: fixed-effect tables with Wald CIs.
 tidy_lm <- function(model, conf.int = TRUE) {
   co <- as.data.frame(summary(model)$coefficients)
   out <- data.frame(
@@ -635,6 +825,11 @@ tidy_mixed_fixed <- function(model, conf.int = TRUE) {
   out
 }
 
+
+# ------------------------------------------------------------
+# 2. Read processed data
+# ------------------------------------------------------------
+
 model_liking <- read_processed_csv("model_liking.csv")
 model_liking_common <- read_processed_csv("model_liking_common_products.csv")
 model_purchase <- read_processed_csv("model_purchase.csv")
@@ -643,6 +838,7 @@ product_panel <- read_processed_csv("product_panel.csv")
 product_context_summary <- read_processed_csv("product_context_summary.csv")
 purchase_product_summary <- read_processed_csv("purchase_product_summary.csv")
 
+# Reconstruct factor variables after CSV import.
 prepare_liking_data <- function(df) {
   df |>
     mutate(
@@ -693,6 +889,11 @@ context_gain <- context_gain |>
 
 product_panel <- product_panel |>
   mutate(product = factor(product))
+
+
+# ------------------------------------------------------------
+# 3. Basic descriptive checks
+# ------------------------------------------------------------
 
 sample_overview <- tibble::tibble(
   dataset = c(
@@ -757,6 +958,12 @@ common_location_overview <- model_liking_common |>
 
 write_table(common_location_overview, "02_location_overview_common_products.csv")
 
+
+# ------------------------------------------------------------
+# 4. Home-lab context gain at product level
+# ------------------------------------------------------------
+
+# Product-level paired comparison and correlations
 context_gain_tests <- tibble::tibble(
   statistic = c(
     "mean_home_liking",
@@ -800,6 +1007,7 @@ context_gain_tests <- tibble::tibble(
 
 write_table(context_gain_tests, "03_context_gain_tests.csv")
 
+# Product-level models.
 m_context_gain_dev <- lm(
   context_gain_liking ~ context_gain_jar_dev_count,
   data = context_gain
@@ -823,6 +1031,7 @@ context_gain_lm_tables <- bind_rows(
 
 write_table(context_gain_lm_tables, "04_context_gain_lm_coefficients.csv")
 
+# Sensitivity: leave-one-product-out correlation.
 context_gain_loo <- dplyr::bind_rows(lapply(
   as.character(context_gain$product),
   function(p) {
@@ -847,6 +1056,7 @@ context_gain_loo <- dplyr::bind_rows(lapply(
 
 write_table(context_gain_loo, "05_context_gain_leave_one_out.csv")
 
+# Explicit sensitivity excluding the visually extreme J09, if present.
 context_gain_no_j09 <- context_gain |> filter(as.character(product) != "J09")
 
 if (nrow(context_gain_no_j09) >= 3) {
@@ -875,6 +1085,8 @@ if (nrow(context_gain_no_j09) >= 3) {
   write_table(context_gain_no_j09_tests, "06_context_gain_sensitivity_no_J09.csv")
 }
 
+
+# Figures for context gain
 p_home_lab <- context_gain |>
   ggplot(aes(x = liking_mean_lab, y = liking_mean_home, label = product)) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
@@ -915,6 +1127,11 @@ p_context_gain <- context_gain |>
   theme_bw()
 
 save_plot(p_context_gain, "02_context_gain_vs_jar_gap.png", width = 7, height = 5)
+
+
+# ------------------------------------------------------------
+# 5. JAR burden descriptive analysis
+# ------------------------------------------------------------
 
 jar_burden_summary_all <- model_liking |>
   group_by(test_location, jar_dev_count) |>
@@ -985,6 +1202,14 @@ p_jar_burden <- jar_burden_summary_common |>
 
 save_plot(p_jar_burden, "03_jar_burden_liking_common_products.png", width = 7, height = 5)
 
+
+# ------------------------------------------------------------
+# 6. Mixed models for liking
+# ------------------------------------------------------------
+
+# Primary context models: common products, product fixed effects.
+# Product fixed effects are conservative for the home-lab comparison
+# because comparisons are made within the common product set.
 m_liking_01_location <- lmer(
   liking ~ test_location + product + (1 | consumer),
   data = model_liking_common,
@@ -1013,6 +1238,7 @@ m_liking_04_jar_count_factor <- lmer(
   control = lmer_control
 )
 
+# Random-product sensitivity model.
 m_liking_02_random_product <- lmer(
   liking ~ test_location + jar_dev_count + (1 | product) + (1 | consumer),
   data = model_liking_common,
@@ -1089,6 +1315,11 @@ write_table(
   "15_emmeans_jar_count_by_location.csv"
 )
 
+
+# ------------------------------------------------------------
+# 7. Direction-specific multivariate JAR penalty model
+# ------------------------------------------------------------
+
 direction_vars <- c(
   "color_too_low",  "color_too_high",
   "fat_too_low",    "fat_too_high",
@@ -1102,6 +1333,9 @@ if (length(missing_direction_vars) > 0) {
        paste(missing_direction_vars, collapse = ", "))
 }
 
+# Main direction-specific model:
+#   fixed effects  = evaluation location, all eight JAR deviations, product
+#   random effects = consumer random intercept
 formula_direction <- as.formula(
   paste(
     "liking ~ test_location +",
@@ -1134,6 +1368,22 @@ m_direction_interaction <- lmer(
 
 write_model_summary(m_direction, "m_direction_specific_jar_penalty.txt")
 write_model_summary(m_direction_interaction, "m_direction_specific_jar_penalty_interactions.txt")
+
+direction_model_specification <- tibble::tibble(
+  model = c(
+    "direction_specific_main",
+    "direction_specific_location_interactions"
+  ),
+  fixed_effects = c(
+    "Evaluation location; eight direction-specific JAR indicators; product",
+    "Evaluation location; eight direction-specific JAR indicators; all location-by-indicator interactions; product"
+  ),
+  random_effects = "Consumer random intercept"
+)
+write_table(
+  direction_model_specification,
+  "16_direction_specific_model_specification.csv"
+)
 
 direction_model_comparison <- anova(m_direction, m_direction_interaction) |>
   as.data.frame() |>
@@ -1197,6 +1447,12 @@ p_direction <- direction_effects |>
 
 save_plot(p_direction, "04_direction_specific_jar_penalties.png", width = 7, height = 5)
 
+
+# ------------------------------------------------------------
+# 8. Measured composition vs JAR perception
+# ------------------------------------------------------------
+
+# Product x context summary of mean JAR scores.
 product_jar_summary <- model_liking |>
   group_by(product, test_location) |>
   summarise(
@@ -1248,6 +1504,8 @@ composition_correlations <- product_jar_summary |>
 
 write_table(composition_correlations, "19_composition_product_level_correlations.csv")
 
+# Mixed model: composition and context. This treats JAR scores as numeric.
+# Because measured composition is a product-level variable, interpret cautiously.
 composition_model <- model_liking_common |>
   filter(
     !is.na(jar_salt),
@@ -1341,6 +1599,11 @@ p_fat <- product_jar_summary |>
 
 save_plot(p_fat, "06_measured_fat_vs_jarfat.png", width = 7, height = 5)
 
+
+# ------------------------------------------------------------
+# 9. Purchase intent analyses
+# ------------------------------------------------------------
+
 purchase_descriptive_by_intent <- model_purchase |>
   group_by(purchase_intent_f) |>
   summarise(
@@ -1385,6 +1648,7 @@ purchase_model_data <- model_purchase |>
     jar_dev_count_z = std(jar_dev_count)
   )
 
+# Sensitivity linear mixed model for ease of coefficient interpretation.
 m_purchase_lmm <- lmer(
   purchase_intent ~ liking_z + price_z + ham_usually_bought_f +
     jar_dev_count + (1 | product) + (1 | consumer),
@@ -1393,6 +1657,7 @@ m_purchase_lmm <- lmer(
   control = lmer_control
 )
 
+# Sensitivity with product fixed effects.
 m_purchase_lmm_product_fixed <- lmer(
   purchase_intent ~ liking_z + price_z + ham_usually_bought_f +
     jar_dev_count + product + (1 | consumer),
@@ -1401,6 +1666,7 @@ m_purchase_lmm_product_fixed <- lmer(
   control = lmer_control
 )
 
+# Sensitivity binary model: "yes" = 1; "no" and "uncertain" = 0.
 m_purchase_glmer_yes <- glmer(
   purchase_yes ~ liking_z + price_z + ham_usually_bought_f +
     jar_dev_count + (1 | product) + (1 | consumer),
@@ -1409,6 +1675,8 @@ m_purchase_glmer_yes <- glmer(
   control = glmer_control
 )
 
+# Primary ordinal cumulative-link mixed model.
+# This can be slower than the linear and binary sensitivity models.
 m_purchase_clmm <- tryCatch(
   ordinal::clmm(
     purchase_intent_ord ~ liking_z + price_z + ham_usually_bought_f +
@@ -1465,7 +1733,11 @@ write_table(purchase_glmer_effects, "25_purchase_yes_glmer_fixed_effects.csv")
 
 if (!inherits(m_purchase_clmm, "error")) {
   purchase_clmm_summary <- as.data.frame(coef(summary(m_purchase_clmm))) |>
-    tibble::rownames_to_column("term")
+    tibble::rownames_to_column("term") |>
+    mutate(
+      model_role = "Primary ordinal purchase-intent model",
+      random_effects = "Consumer and product random intercepts"
+    )
   write_table(purchase_clmm_summary, "26_purchase_clmm_summary.csv")
 }
 
@@ -1530,6 +1802,13 @@ p_purchase_coef <- purchase_coef_plot_data |>
 
 save_plot(p_purchase_coef, "09_purchase_intent_lmm_coefficients.png", width = 7, height = 4.5)
 
+
+# ------------------------------------------------------------
+# 10. Optional product-level exploratory table
+# ------------------------------------------------------------
+
+# Useful for discussion/case examples. Do not over-interpret claim effects causally:
+# product-level claims and labels are not randomized.
 product_exploratory <- product_panel |>
   select(
     product,
@@ -1560,6 +1839,11 @@ product_exploratory <- product_panel |>
 
 write_table(product_exploratory, "27_product_exploratory_panel_for_discussion.csv")
 
+
+# ------------------------------------------------------------
+# 11. Save all model objects and session information
+# ------------------------------------------------------------
+
 models <- list(
   m_context_gain_dev = m_context_gain_dev,
   m_context_gain_severity = m_context_gain_severity,
@@ -1585,6 +1869,9 @@ writeLines(
   file.path(analysis_dir, "session_info.txt")
 )
 
+# ============================================================
+# 3. Sensitivity analyses
+# ============================================================
 root_dir <- HAM_ROOT_DIR
 setwd(root_dir)
 
@@ -1616,6 +1903,7 @@ model_purchase <- read_processed("model_purchase")
 context_gain <- read_processed("context_gain")
 product_panel <- read_processed("product_panel")
 
+# Ensure key factors are properly set
 model_liking_common_products <- model_liking_common_products |>
   mutate(
     product = factor(product),
@@ -1636,9 +1924,13 @@ model_purchase <- model_purchase |>
       ham_usually_bought,
       levels = c(0, 1),
       labels = c("no", "yes")
-    )
+    ),
+    purchase_yes = as.integer(purchase_intent == 1)
   )
 
+# ------------------------------------------------------------
+# 2. Helper functions
+# ------------------------------------------------------------
 write_model_summary <- function(model, filename) {
   sink(file.path(model_dir, filename))
   print(summary(model))
@@ -1651,6 +1943,7 @@ fixed_effects_table <- function(model, model_name = NA_character_) {
   cm$term <- rownames(cm)
   rownames(cm) <- NULL
 
+  # Harmonize column names from lm/lmer/glmer/clmm summaries
   names(cm) <- gsub("Estimate", "estimate", names(cm), fixed = TRUE)
   names(cm) <- gsub("Std. Error", "std_error", names(cm), fixed = TRUE)
   names(cm) <- gsub("t value", "statistic", names(cm), fixed = TRUE)
@@ -1711,6 +2004,13 @@ normal_p <- function(est, se) {
   2 * pnorm(abs(z), lower.tail = FALSE)
 }
 
+# ------------------------------------------------------------
+# 3. Sensitivity analysis 1: remove J09
+# ------------------------------------------------------------
+# Rationale:
+#   J09 had an extreme home-lab liking gap. This checks whether the
+#   main location/JAR conclusions remain after excluding it.
+
 fit_location_jar_models <- function(dat, tag) {
   dat <- droplevels(dat)
 
@@ -1768,12 +2068,14 @@ fit_location_jar_models <- function(dat, tag) {
   ))
 }
 
+ham_message("Fitting J09-exclusion sensitivity models...")
 common_no_j09 <- model_liking_common_products |>
   filter(as.character(product) != "J09") |>
   droplevels()
 
 j09_models <- fit_location_jar_models(common_no_j09, tag = "exclude_J09")
 
+# Product-level context-gain correlations with and without J09
 context_gain_no_j09 <- context_gain |>
   filter(as.character(product) != "J09")
 
@@ -1799,6 +2101,14 @@ j09_context_summary <- tibble(
 )
 write_csv(j09_context_summary, file.path(table_dir, "04_context_gain_correlations_exclude_J09.csv"))
 
+# ------------------------------------------------------------
+# 4. Sensitivity analysis 2: leave-one-product-out correlations
+# ------------------------------------------------------------
+# Rationale:
+#   There are only 16 common products. This checks whether the product-level
+#   relationship between context gain and JAR gap is driven by one product.
+
+ham_message("Running leave-one-product-out correlations...")
 loo_rows <- vector("list", nrow(context_gain))
 for (i in seq_len(nrow(context_gain))) {
   omitted <- as.character(context_gain$product[i])
@@ -1812,12 +2122,12 @@ for (i in seq_len(nrow(context_gain))) {
     omitted_product = omitted,
     n_products = nrow(dat_i),
     pearson_liking_vs_jar_dev_count_gap = safe_cor(dat_i$context_gain_liking, dat_i$context_gain_jar_dev_count, "pearson"),
-    spearman_liking_vs_jar_dev_count_gap = safe_cor(dat_i$context_gain_liking, dat_i$context_gain_jar_dev_count, "spearman"),
     pearson_liking_vs_jar_severity_gap = safe_cor(dat_i$context_gain_liking, dat_i$context_gain_jar_severity, "pearson"),
+    spearman_liking_vs_jar_dev_count_gap = safe_cor(dat_i$context_gain_liking, dat_i$context_gain_jar_dev_count, "spearman"),
     spearman_liking_vs_jar_severity_gap = safe_cor(dat_i$context_gain_liking, dat_i$context_gain_jar_severity, "spearman"),
     slope_jar_dev_count_gap = coef(lm_count)[["context_gain_jar_dev_count"]],
-    p_jar_dev_count_gap = summary(lm_count)$coefficients["context_gain_jar_dev_count", "Pr(>|t|)"],
     slope_jar_severity_gap = coef(lm_sev)[["context_gain_jar_severity"]],
+    p_jar_dev_count_gap = summary(lm_count)$coefficients["context_gain_jar_dev_count", "Pr(>|t|)"],
     p_jar_severity_gap = summary(lm_sev)$coefficients["context_gain_jar_severity", "Pr(>|t|)"]
   )
 }
@@ -1856,6 +2166,14 @@ p_loo <- loo_context |>
 
 ggsave(file.path(figure_dir, "01_leave_one_product_out_correlations.png"), p_loo, width = 8, height = 5, dpi = 300)
 
+# ------------------------------------------------------------
+# 5. Sensitivity analysis 3: direction-specific JAR x location
+# ------------------------------------------------------------
+# Rationale:
+#   The JAR-deviation-count x location interaction was not significant.
+#   Here we check whether any specific directional penalty differs by location.
+
+ham_message("Fitting direction-specific JAR x location model...")
 jar_direction_terms <- c(
   "color_too_low", "color_too_high",
   "fat_too_low", "fat_too_high",
@@ -1890,6 +2208,19 @@ f_int <- as.formula(
 m_direction_no_int <- safe_lmer(f_no_int, data = analysis_direction, REML = FALSE)
 m_direction_int <- safe_lmer(f_int, data = analysis_direction, REML = FALSE)
 
+direction_model_specification <- tibble(
+  model = c("No location interactions", "Location interactions"),
+  fixed_effects = c(
+    "Evaluation location; eight direction-specific JAR indicators; product",
+    "Evaluation location; eight direction-specific JAR indicators; all location-by-indicator interactions; product"
+  ),
+  random_effects = "Consumer random intercept"
+)
+write_csv(
+  direction_model_specification,
+  file.path(table_dir, "07a_direction_specific_model_specification.csv")
+)
+
 write_model_summary(m_direction_no_int, "04_direction_specific_no_location_interactions.txt")
 write_model_summary(m_direction_int, "05_direction_specific_with_location_interactions.txt")
 
@@ -1905,6 +2236,7 @@ lrt_direction <- as.data.frame(anova(m_direction_no_int, m_direction_int)) |>
   tibble::rownames_to_column("model")
 write_csv(lrt_direction, file.path(table_dir, "08_direction_specific_location_interaction_lrt.csv"))
 
+# Location-specific penalties by delta method
 coefs <- lme4::fixef(m_direction_int)
 V <- as.matrix(vcov(m_direction_int))
 coef_names <- names(coefs)
@@ -1982,6 +2314,15 @@ p_dir_loc <- location_specific_penalties |>
 
 ggsave(file.path(figure_dir, "02_direction_specific_penalties_by_location.png"), p_dir_loc, width = 8, height = 5, dpi = 300)
 
+# ------------------------------------------------------------
+# 6. Primary ordinal mixed model for purchase intent
+# ------------------------------------------------------------
+# Rationale:
+#   purchase_intent has ordered categories (-1, 0, 1), so the cumulative-link
+#   mixed model is the primary manuscript specification. The LMM and binary
+#   GLMM are retained as sensitivity analyses.
+
+ham_message("Fitting ordinal mixed model for purchase intent...")
 analysis_purchase_ord <- model_purchase |>
   filter(
     !is.na(purchase_intent_ord),
@@ -1998,6 +2339,7 @@ analysis_purchase_ord <- model_purchase |>
   ) |>
   droplevels()
 
+# Primary ordinal model. A simpler fallback is retained only as a diagnostic; manuscript outputs require the full random-effects structure.
 clmm_formula_full <- purchase_intent_ord ~ liking_z + price_z + ham_usually_bought_f + jar_dev_count +
   (1 | consumer) + (1 | product)
 
@@ -2015,6 +2357,7 @@ m_purchase_clmm <- tryCatch(
     control = ordinal::clmm.control(maxIter = 200, gradTol = 1e-4)
   ),
   error = function(e) {
+    ham_message("Full CLMM failed: ", e$message)
     clmm_fit_status <<- "fallback_consumer_random_intercept_only"
     ordinal::clmm(
       clmm_formula_consumer_only,
@@ -2044,7 +2387,10 @@ clmm_coef <- as.data.frame(coef(summary(m_purchase_clmm))) |>
     odds_ratio = ifelse(parameter_type == "predictor", exp(estimate), NA_real_),
     odds_ratio_low = ifelse(parameter_type == "predictor", exp(estimate - 1.96 * std_error), NA_real_),
     odds_ratio_high = ifelse(parameter_type == "predictor", exp(estimate + 1.96 * std_error), NA_real_),
-    model_fit_status = clmm_fit_status
+    model_fit_status = clmm_fit_status,
+    model_role = "Primary ordinal purchase-intent model",
+    manuscript_compatible =
+      clmm_fit_status == "full_consumer_and_product_random_intercepts"
   )
 
 write_csv(clmm_coef, file.path(table_dir, "10_purchase_intent_ordinal_clmm_coefficients.csv"))
@@ -2070,6 +2416,15 @@ p_clmm <- clmm_coef |>
 
 ggsave(file.path(figure_dir, "03_purchase_intent_ordinal_clmm_odds_ratios.png"), p_clmm, width = 7, height = 4.5, dpi = 300)
 
+# ------------------------------------------------------------
+# 7. Sensitivity analysis 5: bootstrap CI for product-level context gain
+# ------------------------------------------------------------
+# Rationale:
+#   Product-level home-lab differences are based on unequal home sample sizes
+#   and 86 lab evaluations per common product. Bootstrap within product-location
+#   cells gives uncertainty intervals for product-level context gain.
+
+ham_message("Bootstrapping product-level context gain CIs...")
 set.seed(20260705)
 B <- 2000
 common_products <- sort(unique(as.character(model_liking_common_products$product)))
@@ -2117,6 +2472,7 @@ boot_once <- function(b) {
 
 boot_list <- vector("list", B)
 for (b in seq_len(B)) {
+  if (b %% 100 == 0) ham_message("Bootstrap iteration ", b, " / ", B)
   boot_list[[b]] <- boot_once(b)
 }
 boot_context_gain <- bind_rows(boot_list)
@@ -2145,6 +2501,7 @@ boot_context_gain_ci <- boot_context_gain |>
 
 write_csv(boot_context_gain_ci, file.path(table_dir, "11_bootstrap_context_gain_product_ci.csv"))
 
+# Bootstrap product-level correlations by resampled product-level means
 boot_corr <- boot_context_gain |>
   group_by(boot) |>
   summarise(
@@ -2206,6 +2563,15 @@ p_context_gap <- boot_context_gain_ci |>
 
 ggsave(file.path(figure_dir, "05_context_gain_vs_jar_gap_with_bootstrap_ci.png"), p_context_gap, width = 7, height = 5.5, dpi = 300)
 
+# ------------------------------------------------------------
+# 8. Optional model-based context-gain estimates with emmeans
+# ------------------------------------------------------------
+# Rationale:
+#   Provides model-based product-specific home-lab differences with CIs,
+#   using product x location fixed effects and consumer random intercept.
+
+ham_message("Estimating product-specific home-lab differences with emmeans...")
+
 m_product_location <- safe_lmer(
   liking ~ product * test_location + (1 | consumer),
   data = model_liking_common_products,
@@ -2214,12 +2580,16 @@ m_product_location <- safe_lmer(
 write_model_summary(m_product_location, "07_product_by_location_liking_model.txt")
 
 emm <- emmeans::emmeans(m_product_location, ~ test_location | product)
+# Levels should be home, lab. Contrast home - lab.
 emm_contrast <- emmeans::contrast(
   emm,
   method = list(home_minus_lab = c(1, -1)),
   by = "product"
 )
 
+# emmeans uses slightly different CI column names depending on the
+# model type, degrees-of-freedom method and package version.
+# Common examples are lower.CL/upper.CL and asymp.LCL/asymp.UCL.
 emm_context_gain_raw <- as.data.frame(summary(emm_contrast, infer = c(TRUE, TRUE)))
 
 ci_low_col <- intersect(
@@ -2283,12 +2653,15 @@ p_emm_context <- emm_context_gain |>
 
 ggsave(file.path(figure_dir, "06_emmeans_product_specific_context_gain.png"), p_emm_context, width = 7, height = 5.5, dpi = 300)
 
+# ------------------------------------------------------------
+# 9. Combined run summary
+# ------------------------------------------------------------
 run_summary <- tibble(
   item = c(
     "exclude_J09_models",
     "leave_one_product_out_correlations",
     "direction_specific_location_interactions",
-    "ordinal_purchase_intent_model",
+    "primary_ordinal_purchase_intent_model",
     "bootstrap_context_gain_ci",
     "emmeans_product_specific_context_gain"
   ),
@@ -2303,6 +2676,9 @@ run_summary <- tibble(
 )
 write_csv(run_summary, file.path(table_dir, "00_sensitivity_run_summary.csv"))
 
+# ============================================================
+# 4. Manuscript-ready tables and figures
+# ============================================================
 root_dir <- HAM_ROOT_DIR
 setwd(root_dir)
 
@@ -2319,6 +2695,8 @@ out_supp_dir <- file.path(out_dir, "supplementary")
 out_supp_table_dir <- file.path(out_supp_dir, "tables")
 out_supp_figure_dir <- file.path(out_supp_dir, "figures")
 
+# Dedicated TIFF folders are added because some submission systems ask
+# for figure files separately from manuscript PDFs/PNGs.
 out_figure_tiff_dir <- file.path(out_dir, "figures_tiff")
 out_supp_figure_tiff_dir <- file.path(out_supp_dir, "figures_tiff")
 
@@ -2327,6 +2705,11 @@ for (d in c(out_dir, out_table_dir, out_figure_dir, out_figure_tiff_dir,
             out_supp_figure_tiff_dir)) {
   dir.create(d, showWarnings = FALSE, recursive = TRUE)
 }
+
+
+# ------------------------------------------------------------
+# 2. Helper functions
+# ------------------------------------------------------------
 
 read_data_any <- function(rds_path, csv_path = NULL, required = TRUE) {
   if (file.exists(rds_path)) return(readRDS(rds_path))
@@ -2344,6 +2727,7 @@ read_csv_optional <- function(path) {
   if (file.exists(path)) {
     readr::read_csv(path, show_col_types = FALSE)
   } else {
+    ham_message("Optional file not found: ", path)
     NULL
   }
 }
@@ -2353,15 +2737,19 @@ read_csv_required <- function(path) {
   readr::read_csv(path, show_col_types = FALSE)
 }
 
+# Safe check for optional tables returned as NULL.
 has_rows <- function(x) {
   !is.null(x) && is.data.frame(x) && nrow(x) > 0
 }
 
+# Return the first existing column name from a candidate list.
 first_existing_col <- function(df, candidates) {
   hit <- intersect(candidates, names(df))
   if (length(hit) == 0) NA_character_ else hit[1]
 }
 
+# Add a standardized p_value column to model-comparison tables where
+# the likelihood-ratio test column may be named Pr(>Chisq), p.value, etc.
 standardize_p_value_col <- function(df) {
   if ("p_value" %in% names(df)) return(df)
   p_col <- first_existing_col(df, c("Pr(>Chisq)", "Pr..Chisq.", "p.value", "p.value.", "p"))
@@ -2444,12 +2832,18 @@ paper_theme <- function(base_size = 11) {
       panel.grid.major = element_line(linewidth = 0.25),
       strip.background = element_rect(fill = "white", colour = "black"),
       legend.position = "right",
+      # Journal figures are captioned outside the graphic.
+      # Keep axes and legends in the image, but suppress plot titles/subtitles.
       plot.title = element_blank(),
       plot.subtitle = element_blank(),
       axis.title = element_text(face = "bold")
     )
 }
 
+# Robust TIFF writer.  Some Windows/R setups silently fail or complain
+# when TIFF compression is requested through ggsave().  This function first
+# uses grDevices::tiff() directly with LZW compression; if that fails it falls
+# back to an uncompressed TIFF and finally to ggsave(device = "tiff").
 write_tiff_plot <- function(plot, filename, width, height, dpi = 600) {
   dir.create(dirname(filename), showWarnings = FALSE, recursive = TRUE)
 
@@ -2461,6 +2855,7 @@ write_tiff_plot <- function(plot, filename, width, height, dpi = 600) {
 
   success <- FALSE
 
+  # 1) Preferred: base TIFF device with LZW compression.
   tryCatch({
     grDevices::tiff(
       filename = filename,
@@ -2475,8 +2870,10 @@ write_tiff_plot <- function(plot, filename, width, height, dpi = 600) {
     success <<- TRUE
   }, error = function(e) {
     close_device_safely()
+    ham_message("LZW TIFF export failed for ", basename(filename), ": ", conditionMessage(e))
   })
 
+  # 2) Fallback: base TIFF device without compression.
   if (!success) {
     tryCatch({
       grDevices::tiff(
@@ -2492,9 +2889,11 @@ write_tiff_plot <- function(plot, filename, width, height, dpi = 600) {
       success <<- TRUE
     }, error = function(e) {
       close_device_safely()
+      ham_message("Uncompressed TIFF export failed for ", basename(filename), ": ", conditionMessage(e))
     })
   }
 
+  # 3) Final fallback: ggsave with tiff device.
   if (!success) {
     tryCatch({
       ggplot2::ggsave(
@@ -2507,6 +2906,7 @@ write_tiff_plot <- function(plot, filename, width, height, dpi = 600) {
       )
       success <<- TRUE
     }, error = function(e) {
+      ham_message("ggsave TIFF export failed for ", basename(filename), ": ", conditionMessage(e))
     })
   }
 
@@ -2545,8 +2945,10 @@ save_plot_all <- function(plot, filename_base, width = 7, height = 5,
     plot = plot, width = width, height = height
   )
 
+  # Save TIFF in the same folder as PNG/PDF.
   write_tiff_plot(plot, tiff_path, width = width, height = height, dpi = dpi)
 
+  # Also copy TIFF into a dedicated TIFF folder for journal submission.
   tiff_copy_dir <- get_tiff_copy_dir(dir)
   dir.create(tiff_copy_dir, showWarnings = FALSE, recursive = TRUE)
   tiff_copy_path <- file.path(tiff_copy_dir, paste0(filename_base, ".tiff"))
@@ -2577,9 +2979,15 @@ make_est_ci <- function(est, low, high, digits = 2) {
   paste0(fmt_num(est, digits), " [", fmt_num(low, digits), ", ", fmt_num(high, digits), "]")
 }
 
+# Helper for optional columns in select. Keeps the listed columns that exist.
 select_existing <- function(df, cols) {
   df |> dplyr::select(dplyr::any_of(cols))
 }
+
+
+# ------------------------------------------------------------
+# 3. Load processed data and analysis results
+# ------------------------------------------------------------
 
 model_liking <- read_data_any(
   file.path(proc_dir, "model_liking.rds"),
@@ -2606,6 +3014,18 @@ product_panel <- read_data_any(
   file.path(proc_dir, "product_panel.csv")
 )
 
+consumer_demographics <- read_csv_optional(
+  file.path(proc_dir, "consumer_demographics_by_location.csv")
+)
+if (is.null(consumer_demographics)) {
+  warning(
+    "consumer_demographics_by_location.csv was not found. ",
+    "Run the revised 01_load_clean_ham_data script before generating manuscript outputs."
+  )
+  consumer_demographics <- tibble::tibble()
+}
+
+# Core analysis tables
 context_tests <- read_csv_required(file.path(analysis_table_dir, "03_context_gain_tests.csv"))
 liking_model_comp <- read_csv_required(file.path(analysis_table_dir, "10_liking_model_comparison_product_fixed.csv")) |>
   standardize_p_value_col()
@@ -2615,6 +3035,7 @@ composition_corr <- read_csv_required(file.path(analysis_table_dir, "19_composit
 purchase_lmm <- read_csv_required(file.path(analysis_table_dir, "23_purchase_lmm_fixed_effects.csv"))
 purchase_glmer <- read_csv_required(file.path(analysis_table_dir, "25_purchase_yes_glmer_fixed_effects.csv"))
 
+# Sensitivity / supplementary tables
 corr_excl_j09 <- read_csv_optional(file.path(sens_table_dir, "04_context_gain_correlations_exclude_J09.csv"))
 loo_corr <- read_csv_optional(file.path(sens_table_dir, "05_leave_one_product_out_context_gain_correlations.csv"))
 dir_location_lrt <- read_csv_optional(file.path(sens_table_dir, "08_direction_specific_location_interaction_lrt.csv"))
@@ -2625,10 +3046,29 @@ boot_corr_ci <- read_csv_optional(file.path(sens_table_dir, "13_bootstrap_contex
 emm_context_gain <- read_csv_optional(file.path(sens_table_dir, "14_emmeans_product_specific_context_gain.csv"))
 
 if (is.null(purchase_clmm)) purchase_clmm <- tibble::tibble()
+if (has_rows(purchase_clmm)) {
+  if ("manuscript_compatible" %in% names(purchase_clmm)) {
+    compatible_values <- as.logical(purchase_clmm$manuscript_compatible)
+    if (any(!compatible_values, na.rm = TRUE)) {
+      stop(
+        "The primary ordinal CLMM used a fallback random-effects structure. ",
+        "The manuscript requires consumer and product random intercepts; ",
+        "resolve the full CLMM fit before generating Table 5 and Figure 5."
+      )
+    }
+  } else if ("model_fit_status" %in% names(purchase_clmm) &&
+             any(purchase_clmm$model_fit_status !=
+                   "full_consumer_and_product_random_intercepts", na.rm = TRUE)) {
+    stop(
+      "The primary ordinal CLMM did not use both consumer and product random intercepts."
+    )
+  }
+}
 if (is.null(boot_context_ci)) boot_context_ci <- tibble::tibble(product = character())
 if (is.null(boot_corr_ci)) boot_corr_ci <- tibble::tibble()
 if (is.null(emm_context_gain)) emm_context_gain <- tibble::tibble(product = character())
 
+# Harmonize column names from sensitivity-check outputs.
 if (!is.null(loo_corr) && "omitted_product" %in% names(loo_corr) && !"product_removed" %in% names(loo_corr)) {
   loo_corr <- loo_corr |> rename(product_removed = omitted_product)
 }
@@ -2636,6 +3076,7 @@ if (!is.null(dir_by_location) && "jar_term" %in% names(dir_by_location) && !"ter
   dir_by_location <- dir_by_location |> rename(term = jar_term)
 }
 
+# Fix common classes after CSV reading fallback
 for (nm in c("model_liking", "model_liking_common", "model_purchase")) {
   obj <- get(nm)
   if ("product" %in% names(obj)) obj$product <- as.character(obj$product)
@@ -2649,6 +3090,13 @@ product_panel$product <- as.character(product_panel$product)
 common_products <- sort(unique(context_gain$product))
 key_products <- c("J09", "J31", "J10", "J01", "J02", "J24", "J30", "J23")
 
+
+# ------------------------------------------------------------
+# 4. Product-level combined table used by figures and tables
+# ------------------------------------------------------------
+
+# Start from product_panel to include product descriptors, then add bootstrap and emmeans CIs.
+# Prepare optional bootstrap table with consistent columns.
 boot_context_for_join <- boot_context_ci |>
   select_existing(c(
     "product",
@@ -2660,6 +3108,7 @@ boot_context_for_join <- boot_context_ci |>
     "context_gain_jar_severity_high"
   ))
 
+# Prepare optional emmeans table with consistent columns.
 emm_for_join <- emm_context_gain |>
   select_existing(c(
     "product",
@@ -2684,6 +3133,8 @@ product_context <- product_panel |>
   left_join(emm_for_join, by = "product") |>
   arrange(desc(context_gain_liking))
 
+# Add absent optional columns as NA so the script also works without
+# sensitivity-check outputs.
 optional_numeric_cols <- c(
   "context_gain_liking_low", "context_gain_liking_high",
   "context_gain_jar_dev_count_low", "context_gain_jar_dev_count_high",
@@ -2705,6 +3156,15 @@ product_context <- product_context |>
     product_label_main = if_else(product %in% key_products, product, NA_character_)
   ) |>
   arrange(desc(context_gain_liking))
+
+
+# ------------------------------------------------------------
+# 5. Manuscript tables
+# ------------------------------------------------------------
+
+# Table 1. Sample overview -----------------------------------------------------
+# IMPORTANT: These are evaluation-level means and therefore product-frequency weighted.
+# Product-level home-lab comparisons are reported separately in Table 2.
 
 sample_summary <- function(df, dataset_label) {
   tibble::tibble(
@@ -2773,29 +3233,65 @@ write_csv_out(table1_raw, "table1_sample_overview.csv")
 table1_formatted <- table1_raw |>
   transmute(
     Dataset = dataset,
-    `Mean level` = mean_level,
     `Evaluations, n` = n_evaluations,
     `Consumers, n` = n_consumers,
     `Products, n` = n_products,
     `Liking, mean ± SD` = liking,
-    `JAR-deviation count, mean` = fmt_num(jar_dev_count_mean, 2),
-    `JAR severity, mean` = fmt_num(jar_severity_mean, 2),
-    `Price, mean` = fmt_num(price_mean, 2),
-    `Purchase intent, mean` = fmt_num(purchase_intent_mean, 2),
-    `Usually bought, %` = fmt_pct(usual_purchase_rate, 1),
-    `Purchase yes, %` = fmt_pct(purchase_yes_rate, 1)
+    `JAR-deviation count, mean` = fmt_num(jar_dev_count_mean, 2)
   )
 
 write_csv_out(table1_formatted, "table1_sample_overview_formatted.csv")
 
+# Demographic metadata used in the Methods section.
+if (has_rows(consumer_demographics)) {
+  write_csv_out(
+    consumer_demographics,
+    "consumer_demographics_by_location.csv"
+  )
+
+  demographic_sentence <- consumer_demographics |>
+    arrange(match(test_location, c("home", "lab"))) |>
+    transmute(
+      sentence = paste0(
+        test_location, ": n metadata records = ", n_metadata_records,
+        "; female = ", female_n, " (", formatC(female_pct, format = "f", digits = 1), "%)",
+        "; male = ", male_n, " (", formatC(male_pct, format = "f", digits = 1), "%)",
+        "; age 18-30 = ", age_18_30_n, " (", formatC(age_18_30_pct, format = "f", digits = 1), "%)",
+        "; age 31-50 = ", age_31_50_n, " (", formatC(age_31_50_pct, format = "f", digits = 1), "%)",
+        "; age 51+ = ", age_51_plus_n, " (", formatC(age_51_plus_pct, format = "f", digits = 1), "%)",
+        "; unique identifiers = ", n_unique_consumer_ids, "."
+      )
+    ) |>
+    pull(sentence)
+
+  writeLines(
+    c(
+      "Consumer demographic summary for the Methods section:",
+      demographic_sentence,
+      "",
+      "Laboratory percentages summarize metadata records because the metadata contain a duplicated identifier."
+    ),
+    con = file.path(out_table_dir, "consumer_demographics_methods_text.txt")
+  )
+}
+
+# Table 1 note
 writeLines(
   c(
     "Table 1 note:",
     "Means in Table 1 are evaluation-level means and are therefore weighted by the number of evaluations per product.",
-    "Product-level home-lab comparisons are reported in Table 2. Dashes indicate not applicable or unavailable values."
+    "Product-level home-lab comparisons are reported in Table 2.",
+    paste0(
+      "In the home-use purchase-intent dataset, ",
+      formatC(100 * purchase_summary$purchase_yes_rate[1], format = "f", digits = 1),
+      "% of non-missing responses were positive purchase-intent responses (yes)."
+    )
   ),
   con = file.path(out_table_dir, "table1_note.txt")
 )
+
+
+# Table 2. Short main-text product context-gain table --------------------------
 
 table2_main_raw <- product_context |>
   transmute(
@@ -2832,15 +3328,16 @@ table2_main_formatted <- table2_main_raw |>
       context_gain_liking_high,
       2
     ),
-    `Home JAR-deviation count` = fmt_num(jar_dev_count_mean_home, 2),
-    `Lab JAR-deviation count` = fmt_num(jar_dev_count_mean_lab, 2),
-    `JAR-deviation count gap, home-lab` = fmt_num(context_gain_jar_dev_count, 2),
-    `JAR severity gap, home-lab` = fmt_num(context_gain_jar_severity, 2),
-    `Bootstrap classification` = context_gain_significant_boot
+    `JAR-deviation count gap, home-lab` = fmt_num(
+      context_gain_jar_dev_count,
+      2
+    ),
+    Classification = context_gain_significant_boot
   )
 
 write_csv_out(table2_main_formatted, "table2_product_context_gain_main_formatted.csv")
 
+# Full product table as supplement, including product descriptors and market variables.
 table2_full_supp <- product_context |>
   select_existing(c(
     "product", "n_eval_home", "n_eval_lab",
@@ -2859,6 +3356,9 @@ table2_full_supp <- product_context |>
 
 write_csv_out(table2_full_supp, "table_s1_product_context_gain_full.csv", out_supp_table_dir)
 
+
+# Table 3A. Liking model comparison ------------------------------------------
+
 table3a <- liking_model_comp |>
   mutate(
     model_label = dplyr::recode(
@@ -2874,6 +3374,10 @@ table3a <- liking_model_comp |>
   select(model_label, npar, AIC, BIC, logLik, Chisq, Df, p_value, p_value_formatted)
 
 write_csv_out(table3a, "table3a_liking_model_comparison.csv")
+
+# Table 3B. Key fixed effects from liking models ------------------------------
+# Main-text Table 3B is restricted to product fixed-effect models.
+# The random-product model is useful as a sensitivity check and is written to Supplement.
 
 table3b_all <- liking_fixed |>
   filter(term %in% c("test_locationlab", "jar_dev_count", "test_locationlab:jar_dev_count")) |>
@@ -2914,6 +3418,9 @@ if (nrow(table3b_random_product_supp) > 0) {
     out_supp_table_dir
   )
 }
+
+
+# Table 4. Direction-specific JAR penalties with prevalence -------------------
 
 jar_terms <- c(
   "color_too_low", "color_too_high",
@@ -2969,65 +3476,77 @@ write_csv_out(table4, "table4_direction_specific_jar_penalties.csv")
 table4_formatted <- table4 |>
   transmute(
     `JAR deviation` = term_label,
-    Attribute = attribute,
-    Direction = direction,
     `Penalty, liking points [95% CI]` = penalty_ci,
-    `Overall prevalence, n (%)` = paste0(n_deviation_overall, " (", fmt_pct(prevalence_overall, 1), ")"),
-    `Home-use prevalence, n (%)` = paste0(n_deviation_home, " (", fmt_pct(prevalence_home, 1), ")"),
-    `Blind lab prevalence, n (%)` = paste0(n_deviation_lab, " (", fmt_pct(prevalence_lab, 1), ")"),
+    `Overall prevalence, n (%)` = paste0(
+      n_deviation_overall, " (", fmt_pct(prevalence_overall, 1), ")"
+    ),
+    `Home-use prevalence, n (%)` = paste0(
+      n_deviation_home, " (", fmt_pct(prevalence_home, 1), ")"
+    ),
+    `Blind lab prevalence, n (%)` = paste0(
+      n_deviation_lab, " (", fmt_pct(prevalence_lab, 1), ")"
+    ),
     p = p_value_formatted
   )
 
 write_csv_out(table4_formatted, "table4_direction_specific_jar_penalties_formatted.csv")
 
-if (has_rows(purchase_clmm)) {
-  table5_main <- purchase_clmm |>
-    filter(parameter_type == "predictor") |>
-    mutate(
-      term_label = pretty_term_label(term),
-      effect_type = "Ordinal odds ratio",
-      effect = odds_ratio,
-      effect_low = odds_ratio_low,
-      effect_high = odds_ratio_high,
-      effect_ci = make_est_ci(effect, effect_low, effect_high, 2),
-      p_value_formatted = fmt_p(p_value)
-    ) |>
-    select(term, term_label, effect_type, effect, effect_low, effect_high,
-           estimate, std_error, statistic, p_value, effect_ci, p_value_formatted,
-           model_fit_status)
-} else {
-  table5_main <- purchase_glmer |>
-    filter(term != "(Intercept)") |>
-    mutate(
-      term_label = pretty_term_label(term),
-      effect_type = "Odds ratio for purchase yes",
-      effect = odds_ratio,
-      effect_low = odds_ratio_low,
-      effect_high = odds_ratio_high,
-      effect_ci = make_est_ci(effect, effect_low, effect_high, 2),
-      p_value_formatted = fmt_p(p.value),
-      p_value = p.value
-    ) |>
-    select(term, term_label, effect_type, effect, effect_low, effect_high,
-           estimate, std.error, statistic, p_value, effect_ci, p_value_formatted)
+writeLines(
+  c(
+    "Table 4 model specification:",
+    "Fixed effects: evaluation location, all eight direction-specific JAR indicators, and product.",
+    "Random effects: consumer random intercept."
+  ),
+  con = file.path(out_table_dir, "table4_model_specification.txt")
+)
+
+
+# Table 5. Purchase-intent models --------------------------------------------
+
+# Main table: the ordinal CLMM is the prespecified manuscript model.
+# Do not substitute the binary GLMM, because that would change the outcome
+# definition and no longer match the manuscript.
+if (!has_rows(purchase_clmm)) {
+  stop(
+    "Primary ordinal CLMM output is missing. Run the revised sensitivity-check ",
+    "script before generating manuscript tables and figures."
+  )
 }
+
+table5_main <- purchase_clmm |>
+  filter(parameter_type == "predictor") |>
+  mutate(
+    term_label = pretty_term_label(term),
+    effect_type = "Ordinal odds ratio",
+    effect = odds_ratio,
+    effect_low = odds_ratio_low,
+    effect_high = odds_ratio_high,
+    effect_ci = make_est_ci(effect, effect_low, effect_high, 2),
+    p_value_formatted = fmt_p(p_value)
+  ) |>
+  select(
+    term, term_label, effect_type, effect, effect_low, effect_high,
+    estimate, std_error, statistic, p_value, effect_ci, p_value_formatted,
+    any_of(c("model_fit_status", "model_role", "manuscript_compatible"))
+  )
 
 write_csv_out(table5_main, "table5_purchase_intent_ordinal_model.csv")
 
 table5_main_formatted <- table5_main |>
   transmute(
     Predictor = term_label,
-    `Effect type` = effect_type,
-    `Effect [95% CI]` = effect_ci,
+    `Odds ratio [95% CI]` = effect_ci,
     p = p_value_formatted
   )
 
 write_csv_out(table5_main_formatted, "table5_purchase_intent_ordinal_model_formatted.csv")
 
+# Supplementary purchase models: LMM, binary GLMM, and ordinal CLMM if available.
 purchase_lmm_clean <- purchase_lmm |>
   filter(term != "(Intercept)") |>
   transmute(
     outcome_model = "Purchase intent LMM (-1, 0, 1)",
+    outcome_coding = "-1 = no; 0 = uncertain; 1 = yes",
     term,
     term_label = pretty_term_label(term),
     effect_type = "Coefficient",
@@ -3043,6 +3562,7 @@ purchase_glmer_clean <- purchase_glmer |>
   filter(term != "(Intercept)") |>
   transmute(
     outcome_model = "Purchase yes GLMM",
+    outcome_coding = "yes = 1; no or uncertain = 0",
     term,
     term_label = pretty_term_label(term),
     effect_type = "Odds ratio",
@@ -3059,6 +3579,7 @@ purchase_clmm_clean <- if (has_rows(purchase_clmm)) {
     filter(parameter_type == "predictor") |>
     transmute(
       outcome_model = "Purchase intent ordinal CLMM",
+      outcome_coding = "ordered: no < uncertain < yes",
       term,
       term_label = pretty_term_label(term),
       effect_type = "Odds ratio",
@@ -3078,11 +3599,47 @@ table5_supp <- bind_rows(purchase_lmm_clean, purchase_glmer_clean, purchase_clmm
 
 write_csv_out(table5_supp, "table_s2_purchase_intent_all_models.csv", out_supp_table_dir)
 
+
+# Other supplementary tables ---------------------------------------------------
+
 if (!is.null(corr_excl_j09)) {
-  write_csv_out(corr_excl_j09, "table_s3_context_gain_correlations_exclude_J09.csv", out_supp_table_dir)
+  table_s3 <- corr_excl_j09 |>
+    transmute(
+      analysis = dplyr::recode(
+        analysis,
+        "all_common_products" = "All 16 overlapping products",
+        "exclude_J09" = "Excluding product J09",
+        .default = analysis
+      ),
+      n_products,
+      r_count = r_liking_vs_jar_dev_count_gap,
+      r_severity = r_liking_vs_jar_severity_gap,
+      rho_count = spearman_liking_vs_jar_dev_count_gap,
+      rho_severity = spearman_liking_vs_jar_severity_gap
+    )
+  write_csv_out(
+    table_s3,
+    "table_s3_context_gain_correlations_exclude_J09.csv",
+    out_supp_table_dir
+  )
 }
 if (!is.null(loo_corr)) {
-  write_csv_out(loo_corr, "table_s4_leave_one_product_out_context_gain_correlations.csv", out_supp_table_dir)
+  table_s4 <- loo_corr |>
+    transmute(
+      product_removed,
+      n_products,
+      r_count = pearson_liking_vs_jar_dev_count_gap,
+      r_severity = pearson_liking_vs_jar_severity_gap,
+      rho_count = spearman_liking_vs_jar_dev_count_gap,
+      rho_severity = spearman_liking_vs_jar_severity_gap,
+      p_count = p_jar_dev_count_gap,
+      p_severity = p_jar_severity_gap
+    )
+  write_csv_out(
+    table_s4,
+    "table_s4_leave_one_product_out_context_gain_correlations.csv",
+    out_supp_table_dir
+  )
 }
 if (!is.null(dir_location_lrt)) {
   write_csv_out(dir_location_lrt, "table_s5_directional_jar_location_interaction_lrt.csv", out_supp_table_dir)
@@ -3101,6 +3658,7 @@ if (has_rows(emm_context_gain)) {
 }
 write_csv_out(composition_corr, "table_s10_composition_product_level_correlations.csv", out_supp_table_dir)
 
+# Supplementary table: JAR-deviation burden cells used in Figure 3.
 jar_burden_summary <- model_liking_common |>
   filter(!is.na(liking), !is.na(jar_dev_count), !is.na(test_location)) |>
   mutate(
@@ -3117,6 +3675,17 @@ jar_burden_summary <- model_liking_common |>
     .groups = "drop"
   )
 write_csv_out(jar_burden_summary, "table_s11_jar_deviation_burden_by_context.csv", out_supp_table_dir)
+
+
+# ------------------------------------------------------------
+# 6. Figures
+# ------------------------------------------------------------
+# Important: plot titles and subtitles are intentionally omitted from
+# the figure images. The manuscript will provide figure titles and
+# explanations in the figure captions.
+
+# Figure 1. Home-use vs blind-lab product mean liking --------------------------
+# Revision: no regression line. The equality line is the interpretation anchor.
 
 fig1_data <- product_context |>
   mutate(product_label = if_else(product %in% key_products, product, NA_character_))
@@ -3147,6 +3716,7 @@ fig1 <- ggplot(
 
 save_plot_all(fig1, "figure1_home_lab_liking_scatter", width = 7, height = 5.2)
 
+# Supplementary all-label Figure 1.
 fig1_all_labels <- ggplot(fig1_data, aes(x = liking_mean_lab, y = liking_mean_home)) +
   geom_abline(intercept = 0, slope = 1, linetype = "dashed", linewidth = 0.5) +
   geom_point(aes(size = n_eval_home), shape = 21, fill = "white", colour = "black", stroke = 0.8) +
@@ -3173,6 +3743,10 @@ save_plot_all(
   width = 7, height = 5.2,
   dir = out_supp_figure_dir
 )
+
+
+# Figure 2. Context gain vs JAR-deviation gap ---------------------------------
+# Revision: simplified main figure and explicit x-axis meaning.
 
 fig2_data <- product_context |>
   mutate(product_label = if_else(product %in% key_products, product, NA_character_))
@@ -3203,6 +3777,7 @@ fig2 <- ggplot(
 
 save_plot_all(fig2, "figure2_context_gain_vs_jar_deviation_gap", width = 7.2, height = 5.2)
 
+# Supplementary detailed version with bootstrap CIs.
 if (all(c(
   "context_gain_liking_low", "context_gain_liking_high",
   "context_gain_jar_dev_count_low", "context_gain_jar_dev_count_high"
@@ -3254,6 +3829,9 @@ if (all(c(
   )
 }
 
+
+# Figure 3. JAR-deviation burden and liking -----------------------------------
+
 fig3_data <- jar_burden_summary |>
   mutate(
     context_label = factor(context_label, levels = c("Blind lab", "Home-use"))
@@ -3277,6 +3855,7 @@ fig3 <- ggplot(
 
 save_plot_all(fig3, "figure3_jar_deviation_burden_liking", width = 7, height = 5)
 
+# Supplementary Figure 3 with n shown above each point.
 fig3_n <- fig3 +
   geom_text(aes(label = paste0("n=", n)), vjust = -1.1, size = 2.6, show.legend = FALSE)
 
@@ -3288,9 +3867,15 @@ save_plot_all(
   dir = out_supp_figure_dir
 )
 
+
+# Figure 4. Direction-specific JAR penalties ----------------------------------
+# Revision: largest penalty at top. Table 4 contains prevalence.
+
 fig4_data <- table4 |>
   arrange(desc(penalty)) |>
   mutate(
+    # Use a numeric y-position to guarantee that the largest penalty is plotted at the top.
+    # This avoids version-dependent factor-order surprises in horizontal forest plots.
     y_pos = dplyr::row_number(),
     y_pos = max(y_pos) - y_pos + 1,
     term_label_chr = as.character(term_label),
@@ -3317,6 +3902,7 @@ fig4 <- ggplot(
 
 save_plot_all(fig4, "figure4_direction_specific_jar_penalties", width = 7.2, height = 5.2)
 
+# Supplementary version with prevalence in the y-axis labels.
 fig4_prev_data <- fig4_data |>
   mutate(label_with_prev = paste0(term_label_chr, " (", fmt_pct(prevalence_overall, 1), ")"))
 
@@ -3342,6 +3928,10 @@ save_plot_all(
   height = 5.4,
   dir = out_supp_figure_dir
 )
+
+
+# Figure 5. Purchase intent model effects -------------------------------------
+# Revised: ordinal CLMM as the main figure if available.
 
 fig5_order_top_to_bottom <- c("Usually bought: yes", "Liking, z-score", "Price, z-score", "JAR-deviation count")
 fig5_data <- table5_main |>
@@ -3372,6 +3962,9 @@ fig5 <- ggplot(
 
 save_plot_all(fig5, "figure5_purchase_intent_model_effects", width = 7, height = 5)
 
+
+# Supplementary Figure S5. Product-specific context gain with bootstrap CI -----
+
 if (all(c("context_gain_liking_low", "context_gain_liking_high") %in% names(product_context))) {
   fig_s5 <- product_context |>
     mutate(product = factor(product, levels = product[order(context_gain_liking)])) |>
@@ -3393,6 +3986,9 @@ if (all(c("context_gain_liking_low", "context_gain_liking_high") %in% names(prod
     dir = out_supp_figure_dir
   )
 }
+
+
+# Supplementary Figure S6. Leave-one-product-out correlations -----------------
 
 if (!is.null(loo_corr)) {
   loo_long <- loo_corr |>
@@ -3432,6 +4028,9 @@ if (!is.null(loo_corr)) {
   )
 }
 
+
+# Supplementary Figure S7. Direction-specific penalties by location ------------
+
 if (!is.null(dir_by_location)) {
   fig_s7_data <- dir_by_location |>
     mutate(
@@ -3464,6 +4063,9 @@ if (!is.null(dir_by_location)) {
   )
 }
 
+
+# Supplementary Figure S8. Measured composition vs JAR perception --------------
+
 comp_product <- product_panel |>
   filter(!is.na(liking_mean_home) | !is.na(liking_mean_lab)) |>
   select(
@@ -3473,6 +4075,7 @@ comp_product <- product_panel |>
     jar_dev_count_mean_home, jar_dev_count_mean_lab
   )
 
+# Product-level average JARSalt and JARFat by context from model_liking.
 jar_comp <- model_liking |>
   group_by(product, test_location) |>
   summarise(
@@ -3511,6 +4114,9 @@ fig_s8b <- ggplot(jar_comp, aes(x = fat_measured_mean, y = jar_fat_mean, shape =
 
 save_plot_all(fig_s8b, "figure_s8b_measured_fat_vs_jarfat", width = 7, height = 5, dir = out_supp_figure_dir)
 
+
+# Supplementary Figure S9. Purchase-intent descriptive pattern -----------------
+
 purchase_desc <- model_purchase |>
   filter(!is.na(purchase_intent_f)) |>
   mutate(
@@ -3541,6 +4147,11 @@ fig_s9 <- ggplot(purchase_desc, aes(x = purchase_intent_f, y = liking_mean)) +
   paper_theme()
 
 save_plot_all(fig_s9, "figure_s9_liking_by_purchase_intent", width = 6, height = 4.5, dir = out_supp_figure_dir)
+
+
+# ------------------------------------------------------------
+# 7. Captions and notes
+# ------------------------------------------------------------
 
 captions <- tibble::tribble(
   ~item, ~placement, ~caption,
@@ -3579,15 +4190,20 @@ writeLines(
   con = file.path(out_dir, "README_revised_outputs.txt")
 )
 
+
+# ------------------------------------------------------------
+# 8. Figure/table index
+# ------------------------------------------------------------
+
 figure_table_index <- tibble::tribble(
   ~item, ~filename_base_or_csv, ~placement, ~purpose,
   "Table 1", "table1_sample_overview.csv / table1_sample_overview_formatted.csv", "Main text", "Sample size and evaluation-level means by dataset; note that means are product-frequency weighted.",
   "Table 2", "table2_product_context_gain_main.csv / table2_product_context_gain_main_formatted.csv", "Main text", "Short product-level home-lab liking gaps and JAR-deviation gaps.",
-  "Table S1", "table_s1_product_context_gain_full.csv", "Supplement", "Full product-level table including product descriptors, composition, price, and purchase variables.",
+  "Tables S1a-S1b", "table_s1_product_context_gain_full.csv", "Supplement", "Full product-level sensory/context-gain summaries and product descriptors, composition, price, and purchase variables.",
   "Table 3A", "table3a_liking_model_comparison.csv", "Main text", "Model comparison showing improvement after adding JAR-deviation count.",
   "Table 3B", "table3b_liking_key_fixed_effects.csv", "Main text", "Key fixed effects for location, JAR-deviation count, and their interaction; product fixed-effect models only.",
   "Table S13", "table_s13_liking_random_product_sensitivity.csv", "Supplement", "Sensitivity model with random product effect for the key JAR-deviation count model.",
-  "Table 4", "table4_direction_specific_jar_penalties.csv / table4_direction_specific_jar_penalties_formatted.csv", "Main text", "Direction-specific multivariate JAR penalties with prevalence.",
+  "Table 4", "table4_direction_specific_jar_penalties.csv / table4_direction_specific_jar_penalties_formatted.csv / table4_model_specification.txt", "Main text", "Direction-specific multivariate JAR penalties with prevalence; product is a fixed effect and consumer is a random intercept.",
   "Table 5", "table5_purchase_intent_ordinal_model.csv / table5_purchase_intent_ordinal_model_formatted.csv", "Main text", "Ordinal mixed model for purchase intent.",
   "Table S2", "table_s2_purchase_intent_all_models.csv", "Supplement", "Purchase-intent sensitivity models: LMM, binary GLMM, ordinal CLMM.",
   "Figure 1", "figure1_home_lab_liking_scatter", "Main text", "Home-use vs blind-lab product mean liking; equality line only.",
@@ -3602,12 +4218,16 @@ figure_table_index <- tibble::tribble(
   "Figure S5", "figure_s5_product_specific_context_gain_bootstrap_ci", "Supplement", "Product-specific context gain with bootstrap CIs.",
   "Figure S6", "figure_s6_leave_one_product_out_correlations", "Supplement", "Leave-one-product-out robustness of context-gain correlations.",
   "Figure S7", "figure_s7_direction_specific_penalties_by_location", "Supplement", "Exploratory directional penalties by home/lab context.",
-  "Figure S8A", "figure_s8a_measured_salt_vs_jarsalt", "Supplement", "Measured salt vs JARSalt product-level validation.",
-  "Figure S8B", "figure_s8b_measured_fat_vs_jarfat", "Supplement", "Measured fat vs JARFat product-level validation.",
-  "Figure S9", "figure_s9_liking_by_purchase_intent", "Supplement", "Descriptive relationship between liking and purchase-intent category."
+  "Figure S8", "figure_s8a_measured_salt_vs_jarsalt", "Supplement", "Measured salt vs JARSalt product-level validation.",
+  "Figure S9", "figure_s8b_measured_fat_vs_jarfat", "Supplement", "Measured fat vs JARFat product-level validation.",
+  "Figure S10", "figure_s9_liking_by_purchase_intent", "Supplement", "Descriptive relationship between liking and purchase-intent category."
 )
 
 readr::write_csv(figure_table_index, file.path(out_dir, "figure_table_index.csv"), na = "")
+
+# ------------------------------------------------------------
+# 9. TIFF manifest and submission check
+# ------------------------------------------------------------
 
 make_tiff_manifest <- function(dir, placement) {
   files <- list.files(dir, pattern = "\\.tiff$", full.names = TRUE)
@@ -3653,4 +4273,15 @@ if (length(missing_main_tiffs) > 0) {
   warning("Some main TIFF figures were not found in the main figures folder: ",
           paste(missing_main_tiffs, collapse = ", "))
 } else {
+  ham_message("All expected main-text TIFF figures were created.")
 }
+
+ham_message("Revised manuscript tables and figures created")
+ham_message("Output directory: ", out_dir)
+ham_message("Main tables:     ", out_table_dir)
+ham_message("Main figures:    ", out_figure_dir)
+ham_message("Main TIFF copy:  ", out_figure_tiff_dir)
+ham_message("Supplement:      ", out_supp_dir)
+ham_message("Supp TIFF copy:  ", out_supp_figure_tiff_dir)
+ham_message("TIFF manifest:   ", file.path(out_dir, "tiff_file_manifest.csv"))
+ham_message("Index:           ", file.path(out_dir, "figure_table_index.csv"))
